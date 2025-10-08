@@ -3,17 +3,15 @@ package com.example.bajifbo
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.opengl.EGLConfig
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
+import android.util.Log
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.hypot
 
 /**
- * @author dada
- * @date 2025/10/8
- * @desc
+ * OpenGL 刮刮卡渲染器（修正版，非持久模式不会闪烁）
  */
 class ScratchRenderer(val ctx: Context) : GLSurfaceView.Renderer {
 
@@ -22,8 +20,8 @@ attribute vec2 aPosition;
 attribute vec2 aTexCoord;
 varying vec2 vTexCoord;
 void main() {
-vTexCoord = vec2(aTexCoord.x, 1.0 - aTexCoord.y);
-gl_Position = vec4(aPosition, 0.0, 1.0);
+    vTexCoord = aTexCoord;
+    gl_Position = vec4(aPosition, 0.0, 1.0);
 }
 """
 
@@ -34,14 +32,11 @@ uniform sampler2D uFg;
 uniform sampler2D uMask;
 varying vec2 vTexCoord;
 void main() {
-vec4 bg = texture2D(uBg, vTexCoord);
-vec4 fg = texture2D(uFg, vTexCoord);
-// mask stored in ALPHA channel texture
-float m = texture2D(uMask, vTexCoord).a;
-// m==1 -> show bg fully; m==0 -> show fg
-vec3 color = mix(fg.rgb, bg.rgb, m);
-// keep fg alpha as 1
-gl_FragColor = vec4(color, 1.0);
+    vec4 bg = texture2D(uBg, vTexCoord);
+    vec4 fg = texture2D(uFg, vTexCoord);
+    float m = texture2D(uMask, vTexCoord).a;
+    vec3 color = mix(fg.rgb, bg.rgb, m);
+    gl_FragColor = vec4(color, 1.0);
 }
 """
 
@@ -51,151 +46,125 @@ uniform sampler2D uTex;
 uniform float uAlpha;
 varying vec2 vTexCoord;
 void main() {
-vec4 b = texture2D(uTex, vTexCoord);
-// Use brush alpha * uAlpha as the output alpha
-gl_FragColor = vec4(0.0, 0.0, 0.0, b.a * uAlpha);
+    vec4 b = texture2D(uTex, vTexCoord);
+    gl_FragColor = vec4(0.0, 0.0, 0.0, b.a * uAlpha);
 }
 """
 
-    // textures
-    var texBg = 0
-    var texFg = 0
-    var texBrush = 0
+    private var texBg = 0
+    private var texFg = 0
+    private var texBrush = 0
 
+    private var maskFbo = IntArray(1)
+    private var maskTexture = IntArray(1)
 
-    // mask FBO
-    var maskFbo = IntArray(1)
-    var maskTexture = IntArray(1)
+    // 临时 FBO & 纹理用于非持久模式
+    private var tempMaskFbo = IntArray(1)
+    private var tempMaskTexture = IntArray(1)
 
+    private var viewW = 1
+    private var viewH = 1
 
-    // screen size
-    var viewW = 1
-    var viewH = 1
+    private var quadProgram = 0
+    private var stampProgram = 0
 
-
-    // program handles
-    var quadProgram = 0
-    var stampProgram = 0
-
-
-    // preserve flag
     @Volatile
     var preserveErase = true
 
 
-    // touch stamping
-    @Volatile
-    private var pendingStamps = mutableListOf<Stamp>()
-
-
     data class Stamp(val x: Float, val y: Float, val size: Float, val alpha: Float)
 
-    // temporary path tracking
+    private val pendingStamps = mutableListOf<Stamp>()
+
     private var lastX = 0f
     private var lastY = 0f
-    private val stampSpacing = 16f // pixels between stamps
+    private val stampSpacing = 16f
+
+    @Volatile
+    private var isTouching = false
 
     override fun onSurfaceCreated(gl: GL10?, config: javax.microedition.khronos.egl.EGLConfig?) {
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
 
-
-// load textures
         texBg = loadTextureFromAsset(ctx, "bg.webp")
         texFg = loadTextureFromAsset(ctx, "fg.webp")
         texBrush = loadTextureFromAsset(ctx, "brush.png")
 
-
-// programs
         quadProgram = createProgram(VERTEX_SHADER_SIMPLE, FRAGMENT_SHADER_COMPOSITE)
         stampProgram = createProgram(VERTEX_SHADER_SIMPLE, FRAGMENT_SHADER_STAMP)
     }
-
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         viewW = width
         viewH = height
         GLES20.glViewport(0, 0, width, height)
 
-
-// recreate mask FBO texture sized to the view
-        if (maskTexture[0] != 0) {
-// delete old
-            GLES20.glDeleteTextures(1, maskTexture, 0)
-            GLES20.glDeleteFramebuffers(1, maskFbo, 0)
-            maskTexture[0] = 0
-            maskFbo[0] = 0
-        }
         createMaskFbo(width, height)
-
-
-// clear mask if not preserving
-        clearMask(0f)
+        createTempMaskFbo(width, height)
+        clearMask()
     }
 
     override fun onDrawFrame(gl: GL10?) {
-        // If preserve is false, clear mask (so only live strokes will display)
-        if (!preserveErase) {
-            clearMask(0f)
-        }
-
-
-// render pending stamps into mask FBO
         synchronized(pendingStamps) {
             if (pendingStamps.isNotEmpty()) {
-                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, maskFbo[0])
-// draw stamps onto mask using stampProgram
-                GLES20.glViewport(0, 0, viewW, viewH)
-
-
-                GLES20.glEnable(GLES20.GL_BLEND)
-// we want brush alpha to accumulate in mask (source alpha over dest)
-                GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
-
-
-                for (s in pendingStamps) {
-                    drawStampToMask(s)
+                if (preserveErase) {
+                    // 持久模式：累积擦除，绘制到 maskFbo
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, maskFbo[0])
+                    GLES20.glViewport(0, 0, viewW, viewH)
+                    GLES20.glEnable(GLES20.GL_BLEND)
+                    GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE)
+                    for (s in pendingStamps) drawStampToMask(s)
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                }else if (!preserveErase) {
+                    if (isTouching) {
+                        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, tempMaskFbo[0])
+                        GLES20.glViewport(0, 0, viewW, viewH)
+                        GLES20.glClearColor(0f, 0f, 0f, 0f)
+                        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                        GLES20.glEnable(GLES20.GL_BLEND)
+                        GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE)
+                        pendingStamps.lastOrNull()?.let { drawStampToMask(it) }
+                        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                    }
                 }
-
-
-                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
                 pendingStamps.clear()
+            }else if (!isTouching && !preserveErase){
+                Log.d("onDrawFrame", "onDrawFrame: ---->绘制抬起状态")
+                // 手指抬起：重置 tempMask，使其为“未擦除状态”
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, tempMaskFbo[0])
+                GLES20.glViewport(0, 0, viewW, viewH)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
             }
         }
 
-// Now composite final result to screen with quadProgram
+        // 绘制合成结果
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         GLES20.glUseProgram(quadProgram)
 
-
-// attributes & uniforms
         val aPos = GLES20.glGetAttribLocation(quadProgram, "aPosition")
         val aTex = GLES20.glGetAttribLocation(quadProgram, "aTexCoord")
         val uBg = GLES20.glGetUniformLocation(quadProgram, "uBg")
         val uFg = GLES20.glGetUniformLocation(quadProgram, "uFg")
         val uMask = GLES20.glGetUniformLocation(quadProgram, "uMask")
 
-
-// full-screen quad verts
         val quadVerts = floatArrayOf(
-            -1f, -1f, 0f, 1f,
-            1f, -1f, 1f, 1f,
-            -1f, 1f, 0f, 0f,
-            1f, 1f, 1f, 0f
+            -1f, -1f, 0f, 0f,
+            1f, -1f, 1f, 0f,
+            -1f, 1f, 0f, 1f,
+            1f, 1f, 1f, 1f
         )
-
 
         val vb = makeFloatBuffer(quadVerts)
         vb.position(0)
         GLES20.glEnableVertexAttribArray(aPos)
-        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 4 * 4, vb)
+        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, vb)
         vb.position(2)
         GLES20.glEnableVertexAttribArray(aTex)
-        GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 4 * 4, vb)
+        GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 16, vb)
 
-
-// bind textures to units
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texBg)
         GLES20.glUniform1i(uBg, 0)
@@ -203,65 +172,19 @@ gl_FragColor = vec4(0.0, 0.0, 0.0, b.a * uAlpha);
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texFg)
         GLES20.glUniform1i(uFg, 1)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE2)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTexture[0])
+        GLES20.glBindTexture(
+            GLES20.GL_TEXTURE_2D,
+            if (preserveErase) {
+                maskTexture[0]
+            } else {
+                tempMaskTexture[0]
+            }
+        )
         GLES20.glUniform1i(uMask, 2)
 
-
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-
-
         GLES20.glDisableVertexAttribArray(aPos)
         GLES20.glDisableVertexAttribArray(aTex)
-
-
-    }
-
-    fun makeFloatBuffer(arr: FloatArray): java.nio.FloatBuffer {
-        val bb = java.nio.ByteBuffer.allocateDirect(arr.size * 4)
-        bb.order(java.nio.ByteOrder.nativeOrder())
-        val fb = bb.asFloatBuffer()
-        fb.put(arr)
-        fb.position(0)
-        return fb
-    }
-
-    // touch helpers - convert view coords to clip space when stamping
-    fun touchDown(x: Float, y: Float) {
-        lastX = x
-        lastY = y
-        stampAt(x, y)
-    }
-
-    fun touchMove(x: Float, y: Float) {
-// stamp along line from last to current
-        var dx = x - lastX
-        var dy = y - lastY
-        val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat()
-        if (dist >= stampSpacing) {
-            val steps = (dist / stampSpacing).toInt()
-            for (i in 1..steps) {
-                val t = i.toFloat() / steps
-                val sx = lastX + dx * t
-                val sy = lastY + dy * t
-                stampAt(sx, sy)
-            }
-            lastX = x
-            lastY = y
-        }
-    }
-
-    fun touchUp(x: Float, y: Float) {
-// final small stamp
-        stampAt(x, y)
-    }
-
-    private fun stampAt(x: Float, y: Float) {
-// map to view coords (y inverted for GL texture coords later)
-        val size =
-            330f * (viewW.toFloat() / 1125f) // scale brush by screen width ratio to original asset
-        synchronized(pendingStamps) {
-            pendingStamps.add(Stamp(x, y, size, 1.0f))
-        }
     }
 
     private fun drawStampToMask(s: Stamp) {
@@ -269,125 +192,171 @@ gl_FragColor = vec4(0.0, 0.0, 0.0, b.a * uAlpha);
         val aPos = GLES20.glGetAttribLocation(stampProgram, "aPosition")
         val aTex = GLES20.glGetAttribLocation(stampProgram, "aTexCoord")
         val uTex = GLES20.glGetUniformLocation(stampProgram, "uTex")
-        val uTransform = GLES20.glGetUniformLocation(stampProgram, "uTransform")
         val uAlpha = GLES20.glGetUniformLocation(stampProgram, "uAlpha")
 
-
-// compute quad in NDC for the stamp's position/size
-// convert pixel coords to NDC (-1..1), careful with y flip
         val cx = (s.x / viewW.toFloat()) * 2f - 1f
-        val cy = -((s.y / viewH.toFloat()) * 2f - 1f)
-        val halfW = (s.size / viewW.toFloat())
-        val halfH = (s.size / viewH.toFloat())
-
+        val cy = ((s.y / viewH.toFloat()) * 2f - 1f) * -1f
+        val halfW = s.size / viewW.toFloat()
+        val halfH = s.size / viewH.toFloat()
 
         val left = cx - halfW
         val right = cx + halfW
         val bottom = cy - halfH
         val top = cy + halfH
 
-
         val verts = floatArrayOf(
-            left, bottom, 0f, 1f,
-            right, bottom, 1f, 1f,
-            left, top, 0f, 0f,
-            right, top, 1f, 0f
+            left, bottom, 0f, 0f,
+            right, bottom, 1f, 0f,
+            left, top, 0f, 1f,
+            right, top, 1f, 1f
         )
-
 
         val vb = makeFloatBuffer(verts)
         vb.position(0)
         GLES20.glEnableVertexAttribArray(aPos)
-        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 4 * 4, vb)
+        GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 16, vb)
         vb.position(2)
         GLES20.glEnableVertexAttribArray(aTex)
-        GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 4 * 4, vb)
-
+        GLES20.glVertexAttribPointer(aTex, 2, GLES20.GL_FLOAT, false, 16, vb)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texBrush)
         GLES20.glUniform1i(uTex, 0)
-        GLES20.glUniform1f(uAlpha, s.alpha)
+        if (!isTouching && !preserveErase){
+            GLES20.glUniform1f(uAlpha, 0f)
+        }else{
+            GLES20.glUniform1f(uAlpha, s.alpha)
+        }
 
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-
-
         GLES20.glDisableVertexAttribArray(aPos)
         GLES20.glDisableVertexAttribArray(aTex)
     }
 
-    // utilities: create FBO + texture to store mask
     private fun createMaskFbo(w: Int, h: Int) {
-        // 如果已有先删除（你原来在 onSurfaceChanged 已做，但为保险可再删）
-        if (maskTexture[0] != 0) {
-            GLES20.glDeleteTextures(1, maskTexture, 0)
-            maskTexture[0] = 0
-        }
-        if (maskFbo[0] != 0) {
-            GLES20.glDeleteFramebuffers(1, maskFbo, 0)
-            maskFbo[0] = 0
-        }
+        if (maskTexture[0] != 0) GLES20.glDeleteTextures(1, maskTexture, 0)
+        if (maskFbo[0] != 0) GLES20.glDeleteFramebuffers(1, maskFbo, 0)
 
         GLES20.glGenTextures(1, maskTexture, 0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, maskTexture[0])
-
-        // 使用 RGBA 而不是 GL_ALPHA（更兼容，能作为 COLOR_ATTACHMENT0）
         GLES20.glTexImage2D(
-            GLES20.GL_TEXTURE_2D,
-            0,
-            GLES20.GL_RGBA,
-            w,
-            h,
-            0,
-            GLES20.GL_RGBA,
-            GLES20.GL_UNSIGNED_BYTE,
-            null
+            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0,
+            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null
         )
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(
+            GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_WRAP_S,
+            GLES20.GL_CLAMP_TO_EDGE
+        )
+        GLES20.glTexParameteri(
+            GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_WRAP_T,
+            GLES20.GL_CLAMP_TO_EDGE
+        )
 
         GLES20.glGenFramebuffers(1, maskFbo, 0)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, maskFbo[0])
         GLES20.glFramebufferTexture2D(
-            GLES20.GL_FRAMEBUFFER,
-            GLES20.GL_COLOR_ATTACHMENT0,
+            GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+            GLES20.GL_TEXTURE_2D, maskTexture[0], 0
+        )
+        if (GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) != GLES20.GL_FRAMEBUFFER_COMPLETE)
+            throw RuntimeException("Framebuffer not complete")
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+    }
+
+    private fun createTempMaskFbo(w: Int, h: Int) {
+        if (tempMaskTexture[0] != 0) GLES20.glDeleteTextures(1, tempMaskTexture, 0)
+        if (tempMaskFbo[0] != 0) GLES20.glDeleteFramebuffers(1, tempMaskFbo, 0)
+
+        GLES20.glGenTextures(1, tempMaskTexture, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tempMaskTexture[0])
+        GLES20.glTexImage2D(
+            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, w, h, 0,
+            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null
+        )
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(
             GLES20.GL_TEXTURE_2D,
-            maskTexture[0],
-            0
+            GLES20.GL_TEXTURE_WRAP_S,
+            GLES20.GL_CLAMP_TO_EDGE
+        )
+        GLES20.glTexParameteri(
+            GLES20.GL_TEXTURE_2D,
+            GLES20.GL_TEXTURE_WRAP_T,
+            GLES20.GL_CLAMP_TO_EDGE
         )
 
-        val status = GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER)
-        if (status != GLES20.GL_FRAMEBUFFER_COMPLETE) {
-            // 帮助调试：把 status 打出来（或映射为字符串）
-            throw RuntimeException("Framebuffer not complete: $status")
-        }
-
-        // 解绑
+        GLES20.glGenFramebuffers(1, tempMaskFbo, 0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, tempMaskFbo[0])
+        GLES20.glFramebufferTexture2D(
+            GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+            GLES20.GL_TEXTURE_2D, tempMaskTexture[0], 0
+        )
+        if (GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) != GLES20.GL_FRAMEBUFFER_COMPLETE)
+            throw RuntimeException("Temp framebuffer not complete")
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
     }
 
-
-    private fun clearMask(alpha: Float) {
+    private fun clearMask() {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, maskFbo[0])
-// clear alpha channel value to alpha (0..1)
-// use glColorMask to write only alpha channel
-        GLES20.glColorMask(false, false, false, true)
-        GLES20.glClearColor(0f, 0f, 0f, alpha)
+        GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        GLES20.glColorMask(true, true, true, true)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
     }
 
-    // GL helper: load texture from assets
-    private fun loadTextureFromAsset(ctx: Context, name: String): Int {
-        val ism = ctx.assets.open(name)
-        var bmp = BitmapFactory.decodeStream(ism)
-        ism.close()
+    fun makeFloatBuffer(arr: FloatArray) = java.nio.ByteBuffer.allocateDirect(arr.size * 4)
+        .order(java.nio.ByteOrder.nativeOrder())
+        .asFloatBuffer().apply { put(arr); position(0) }
 
-        // ✅ 在这里翻转 bitmap（上下反转一次）
+    fun touchDown(x: Float, y: Float) {
+        isTouching = true
+        lastX = x
+        lastY = y
+        stampAt(x, y)
+    }
+
+    fun touchMove(x: Float, y: Float) {
+        val dx = x - lastX
+        val dy = y - lastY
+        val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+        if (dist >= stampSpacing) {
+            val steps = (dist / stampSpacing).toInt()
+            for (i in 1..steps) {
+                val t = i / steps.toFloat()
+                stampAt(lastX + dx * t, lastY + dy * t)
+            }
+            lastX = x
+            lastY = y
+        }
+    }
+
+    fun touchUp(x: Float, y: Float) {
+
+        Log.d("onDrawFrame", "touchUp: ---->抬起状态")
+        // 非持久模式：手指抬起时清空临时 FBO
+        isTouching = false
+        if (!preserveErase) {
+            synchronized(pendingStamps) { pendingStamps.clear() }
+        } else {
+            stampAt(x, y)
+        }
+    }
+
+    private fun stampAt(x: Float, y: Float) {
+        val size = 330f * (viewW / 1125f)
+        synchronized(pendingStamps) { pendingStamps.add(Stamp(x, y, size, 1f)) }
+    }
+
+    private fun loadTextureFromAsset(ctx: Context, name: String): Int {
+        val input = ctx.assets.open(name)
+        var bmp = BitmapFactory.decodeStream(input)
+        input.close()
+
         val matrix = android.graphics.Matrix()
         matrix.preScale(1f, -1f)
         bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, matrix, false)
@@ -412,22 +381,23 @@ gl_FragColor = vec4(0.0, 0.0, 0.0, b.a * uAlpha);
         return tex[0]
     }
 
-    // minimal shader utilities
     private fun createProgram(vsSource: String, fsSource: String): Int {
         val vs = loadShader(GLES20.GL_VERTEX_SHADER, vsSource)
         val fs = loadShader(GLES20.GL_FRAGMENT_SHADER, fsSource)
-        val prog = GLES20.glCreateProgram()
-        GLES20.glAttachShader(prog, vs)
-        GLES20.glAttachShader(prog, fs)
-        GLES20.glLinkProgram(prog)
-        val linkStatus = IntArray(1)
-        GLES20.glGetProgramiv(prog, GLES20.GL_LINK_STATUS, linkStatus, 0)
-        if (linkStatus[0] == 0) {
-            val log = GLES20.glGetProgramInfoLog(prog)
-            GLES20.glDeleteProgram(prog)
-            throw RuntimeException("Could not link program: $log")
-        }
-        return prog
+        val program = GLES20.glCreateProgram()
+        GLES20.glAttachShader(program, vs)
+        GLES20.glAttachShader(program, fs)
+        GLES20.glLinkProgram(program)
+        val status = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, status, 0)
+        if (status[0] == 0) throw RuntimeException(
+            "Program link error: ${
+                GLES20.glGetProgramInfoLog(
+                    program
+                )
+            }"
+        )
+        return program
     }
 
     private fun loadShader(type: Int, source: String): Int {
@@ -436,12 +406,13 @@ gl_FragColor = vec4(0.0, 0.0, 0.0, b.a * uAlpha);
         GLES20.glCompileShader(shader)
         val compiled = IntArray(1)
         GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
-        if (compiled[0] == 0) {
-            val log = GLES20.glGetShaderInfoLog(shader)
-            GLES20.glDeleteShader(shader)
-            throw RuntimeException("Could not compile shader: $log")
-        }
+        if (compiled[0] == 0) throw RuntimeException(
+            "Shader compile error: ${
+                GLES20.glGetShaderInfoLog(
+                    shader
+                )
+            }"
+        )
         return shader
     }
-
 }
