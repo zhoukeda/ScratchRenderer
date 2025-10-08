@@ -103,12 +103,15 @@ void main() {
 
         createMaskFbo(width, height)
         createTempMaskFbo(width, height)
-        clearMask()
+
+
+        GLES20.glClearColor(0f, 0f, 0f, 0f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
     }
 
     override fun onDrawFrame(gl: GL10?) {
         synchronized(pendingStamps) {
-            if (pendingStamps.isNotEmpty()) {
                 if (preserveErase) {
                     // 持久模式：累积擦除，绘制到 maskFbo
                     GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, maskFbo[0])
@@ -117,7 +120,7 @@ void main() {
                     GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE)
                     for (s in pendingStamps) drawStampToMask(s)
                     GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-                }else if (!preserveErase) {
+                } else if (!preserveErase) {
                     if (isTouching) {
                         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, tempMaskFbo[0])
                         GLES20.glViewport(0, 0, viewW, viewH)
@@ -127,18 +130,14 @@ void main() {
                         GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE)
                         pendingStamps.lastOrNull()?.let { drawStampToMask(it) }
                         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                    }else if (!isTouching && !preserveErase) {
+                        Log.d("onDrawFrame", "onDrawFrame: ---->绘制抬起状态")
+                        // 手指抬起：重置 tempMask，使其为“未擦除状态”
+                        resetMask()
                     }
                 }
                 pendingStamps.clear()
-            }else if (!isTouching && !preserveErase){
-                Log.d("onDrawFrame", "onDrawFrame: ---->绘制抬起状态")
-                // 手指抬起：重置 tempMask，使其为“未擦除状态”
-                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, tempMaskFbo[0])
-                GLES20.glViewport(0, 0, viewW, viewH)
-                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
             }
-        }
 
         // 绘制合成结果
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
@@ -187,6 +186,7 @@ void main() {
         GLES20.glDisableVertexAttribArray(aTex)
     }
 
+
     private fun drawStampToMask(s: Stamp) {
         GLES20.glUseProgram(stampProgram)
         val aPos = GLES20.glGetAttribLocation(stampProgram, "aPosition")
@@ -222,9 +222,9 @@ void main() {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texBrush)
         GLES20.glUniform1i(uTex, 0)
-        if (!isTouching && !preserveErase){
+        if (!isTouching && !preserveErase) {
             GLES20.glUniform1f(uAlpha, 0f)
-        }else{
+        } else {
             GLES20.glUniform1f(uAlpha, s.alpha)
         }
 
@@ -232,6 +232,11 @@ void main() {
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         GLES20.glDisableVertexAttribArray(aPos)
         GLES20.glDisableVertexAttribArray(aTex)
+    }
+
+    fun changePreserveErase(isPreserveErase: Boolean) {
+        resetMask()
+        preserveErase = isPreserveErase
     }
 
     private fun createMaskFbo(w: Int, h: Int) {
@@ -302,8 +307,15 @@ void main() {
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
     }
 
-    private fun clearMask() {
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, maskFbo[0])
+    private fun resetMask() {
+        synchronized(pendingStamps) { pendingStamps.clear() }
+        GLES20.glBindFramebuffer(
+            GLES20.GL_FRAMEBUFFER, if (!preserveErase) {
+                tempMaskFbo[0]
+            } else {
+                maskFbo[0]
+            }
+        )
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
@@ -336,16 +348,16 @@ void main() {
     }
 
     fun touchUp(x: Float, y: Float) {
-
         Log.d("onDrawFrame", "touchUp: ---->抬起状态")
         // 非持久模式：手指抬起时清空临时 FBO
         isTouching = false
         if (!preserveErase) {
-            synchronized(pendingStamps) { pendingStamps.clear() }
+            resetMask()
         } else {
             stampAt(x, y)
         }
     }
+
 
     private fun stampAt(x: Float, y: Float) {
         val size = 330f * (viewW / 1125f)

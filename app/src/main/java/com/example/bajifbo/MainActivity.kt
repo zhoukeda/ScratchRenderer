@@ -29,7 +29,7 @@ class MainActivity : AppCompatActivity() {
             text = "保持擦除"
             isChecked = true
             setOnCheckedChangeListener { _, isChecked ->
-                glView.renderer.preserveErase = isChecked
+                glView.renderer.changePreserveErase(isChecked)
             }
 // small layout params
             val lp = FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT)
