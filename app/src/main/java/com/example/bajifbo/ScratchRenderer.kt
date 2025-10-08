@@ -71,6 +71,9 @@ void main() {
     @Volatile
     var preserveErase = true
 
+    private var maskWidth = 330f
+    private var fgWidth = 1125f
+
 
     data class Stamp(val x: Float, val y: Float, val size: Float, val alpha: Float)
 
@@ -120,23 +123,25 @@ void main() {
                     GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE)
                     for (s in pendingStamps) drawStampToMask(s)
                     GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                    pendingStamps.clear()
                 } else if (!preserveErase) {
                     if (isTouching) {
                         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, tempMaskFbo[0])
                         GLES20.glViewport(0, 0, viewW, viewH)
+                        // ✅ 每帧清空，确保只显示当前触摸点
                         GLES20.glClearColor(0f, 0f, 0f, 0f)
                         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
                         GLES20.glEnable(GLES20.GL_BLEND)
                         GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE)
+                        // 只绘制最后一个刮擦点
                         pendingStamps.lastOrNull()?.let { drawStampToMask(it) }
                         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-                    }else if (!isTouching && !preserveErase) {
-                        Log.d("onDrawFrame", "onDrawFrame: ---->绘制抬起状态")
+                    }else{
                         // 手指抬起：重置 tempMask，使其为“未擦除状态”
                         resetMask()
                     }
                 }
-                pendingStamps.clear()
+
             }
 
         // 绘制合成结果
@@ -309,15 +314,17 @@ void main() {
 
     private fun resetMask() {
         synchronized(pendingStamps) { pendingStamps.clear() }
-        GLES20.glBindFramebuffer(
-            GLES20.GL_FRAMEBUFFER, if (!preserveErase) {
-                tempMaskFbo[0]
-            } else {
-                maskFbo[0]
-            }
-        )
+
+        // 重置持久化 FBO
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, maskFbo[0])
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
+        // 重置临时 FBO
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, tempMaskFbo[0])
+        GLES20.glClearColor(0f, 0f, 0f, 0f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
     }
 
@@ -336,12 +343,21 @@ void main() {
         val dx = x - lastX
         val dy = y - lastY
         val dist = hypot(dx.toDouble(), dy.toDouble()).toFloat()
-        if (dist >= stampSpacing) {
-            val steps = (dist / stampSpacing).toInt()
-            for (i in 1..steps) {
-                val t = i / steps.toFloat()
-                stampAt(lastX + dx * t, lastY + dy * t)
+
+        if (preserveErase) {
+            // 持久模式：添加多个中间点形成连续路径
+            if (dist >= stampSpacing) {
+                val steps = (dist / stampSpacing).toInt()
+                for (i in 1..steps) {
+                    val t = i / steps.toFloat()
+                    stampAt(lastX + dx * t, lastY + dy * t)
+                }
+                lastX = x
+                lastY = y
             }
+        } else {
+            // 非持久模式：只添加最后一个点
+            stampAt(x, y)
             lastX = x
             lastY = y
         }
@@ -360,8 +376,17 @@ void main() {
 
 
     private fun stampAt(x: Float, y: Float) {
-        val size = 330f * (viewW / 1125f)
-        synchronized(pendingStamps) { pendingStamps.add(Stamp(x, y, size, 1f)) }
+
+        synchronized(pendingStamps) {
+            if (preserveErase){
+                val size = maskWidth * (viewW / fgWidth)
+                pendingStamps.add(Stamp(x, y, size, 1f))
+            }else{
+                val size = maskWidth * (viewW / fgWidth) * 1.5f
+                pendingStamps.add(Stamp(x, y - maskWidth / 2, size, 1f))
+            }
+
+        }
     }
 
     private fun loadTextureFromAsset(ctx: Context, name: String): Int {
