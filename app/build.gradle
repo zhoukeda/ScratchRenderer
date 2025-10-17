@@ -40,4 +40,7 @@ dependencies {
     testImplementation libs.junit
     androidTestImplementation libs.androidx.junit
     androidTestImplementation libs.androidx.espresso.core
+
+    api 'com.blankj:utilcodex:1.31.0'
+    implementation 'dev.romainguy:pathway:0.18.0'
 }
